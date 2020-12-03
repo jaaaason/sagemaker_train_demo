@@ -1,0 +1,128 @@
+#!/usr/bin/env python
+
+# A sample training component that trains a simple scikit-learn decision tree funsion_model.
+# This implementation works in File mode and makes no assumptions about the input file names.
+# Input is specified as CSV with a data point in each row and the labels in the first column.
+
+from __future__ import print_function
+
+import os
+import json
+import pickle
+import sys
+import traceback
+import numpy as np
+import lightgbm as lgb
+import xgboost as xgb
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+from funsion_model import hw_process
+
+prefix = '/opt/ml/'
+
+input_path = prefix + 'input/data'
+output_path = os.path.join(prefix, 'output')
+model_path = os.path.join(prefix, '')
+param_path = os.path.join(prefix, 'input/config/hyperparameters.json')
+
+channel_name='training'
+training_path = os.path.join(input_path, channel_name)
+
+# The function to execute the training.
+def train():
+    print('Starting the training.')
+    try:
+        # Read in any hyperparameters that the user passed with the training job
+        with open(param_path, 'r') as tc:
+            trainingParams = json.load(tc)
+
+        # Take the set of files and read them all into a single pandas dataframe
+        input_file = os.path.join(training_path, 'input.pkl')
+        with open('data/inputu.pkl', 'rb') as file:
+            df1 = pickle.load(file)
+
+        ignore_col = ['指标']
+        target_col = ['W1', 'W2', 'W3', 'TOTAL']
+        info_col = []
+        nan_col = []
+        df1['month'] = df1['year_month'].apply(lambda x: x % 100)
+        year_month_list = list(set(df1['year_month']))
+        year_month_list.sort()
+        year_month_dict = dict(zip(year_month_list, range(len(year_month_list))))
+        df1['time_len'] = df1['year_month'].apply(lambda x: year_month_dict[x])
+        df1['is_season'] = df1['time_len'].apply(lambda x: x % 6)
+        for col in df1.columns:
+            if col in ignore_col:
+                continue
+            if col in target_col:
+                df1[col] = df1[col].astype(float)
+                continue
+            if any(df1[col].isna()):
+                df1[col] = df1[col].astype(float)
+                df1[col] = df1[col].interpolate(method='linear')
+                nan_col.append(col)
+                continue
+            df1[col] = df1[col].astype(float)
+            info_col.append(col)
+        info_col.remove('year_month')
+
+        insample = df1.loc[(df1['year_month'] < df1.loc[(df1['W1'].isna()), 'year_month'].min())]
+
+        # PCA reduce covariates dimension
+        pca = PCA(n_components=len(info_col), random_state=0)
+        sd = StandardScaler()
+        pca.fit(sd.fit_transform(df1[info_col]))
+        ratio = np.cumsum(pca.explained_variance_ratio_)
+        n_feat = len(ratio[(ratio <= 0.9)])
+        co_var = pca.transform(sd.fit_transform(df1[info_col]))[:, :n_feat]
+
+        assert len(ratio) == len(pca.explained_variance_ratio_)
+
+        co_var_insample = co_var[:len(insample)]
+        sel_features = ['month', 'time_len', 'is_season']
+        for target_col in ['W1', 'W2', 'W3']:
+            train_val_split_point = len(insample.loc[~(insample['W1'].isna()), :])
+            co_var_tr, co_var_val = co_var_insample[:train_val_split_point], co_var_insample[train_val_split_point:]
+            tr_X, val_X = insample[sel_features][:train_val_split_point], insample[sel_features][train_val_split_point:]
+            tr_y, val_y = insample[target_col][:train_val_split_point], insample[target_col][train_val_split_point:]
+            outpush = len(val_y)
+            tr_fcst_hw, val_fcst_hw = hw_process(np.log1p(tr_y.values),
+                                                 outpush=outpush,
+                                                 damping_slope=0.9,
+                                                 trend="add",
+                                                 seasonal="add",
+                                                 seasonal_periods=6)
+            md_lgb = lgb.LGBMRegressor(n_estimators=100, learning_rate=0.01, max_depth=5,
+                                       num_leaves=10, min_child_samples=1, random_state=0)
+            md_rb = RandomForestRegressor(n_estimators=100, max_depth=5, min_samples_leaf=1, random_state=0)
+            md_xgb = xgb.XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.1, min_child_samples=0.001,
+                                      num_leaves=10,
+                                      random_state=0)
+
+            tr_feat = np.concatenate((tr_X.values, co_var_tr, tr_fcst_hw.reshape(-1, 1)), axis=1)
+            model_list = [md_xgb, md_lgb, md_rb]
+            for md in model_list:
+                md.fit(tr_feat, np.log1p(tr_y))
+
+        # save the funsion_model
+        with open(os.path.join(model_path, 'fusion_model.pkl'), 'w') as out:
+            pickle.dump(model_list, out)
+        print('Training complete.')
+    except Exception as e:
+        # Write out an error file. This will be returned as the failureReason in the
+        # DescribeTrainingJob result.
+        trc = traceback.format_exc()
+        with open(os.path.join(output_path, 'failure'), 'w') as s:
+            s.write('Exception during training: ' + str(e) + '\n' + trc)
+        # Printing this causes the exception to be in the training job logs, as well.
+        print('Exception during training: ' + str(e) + '\n' + trc, file=sys.stderr)
+        # A non-zero exit code causes the training job to be marked as Failed.
+        sys.exit(255)
+
+if __name__ == '__main__':
+    train()
+
+    # A zero exit code causes the job to be marked a Succeeded.
+    sys.exit(0)
